@@ -1,8 +1,14 @@
 import winston from 'winston';
+import path from 'path';
+import os from 'os';
 
 // Force no colors for MCP server mode - multiple approaches
 process.env.NO_COLOR = '1';
 process.env.FORCE_COLOR = '0';
+
+// Log directory: use LOG_DIR env var, or default to ~/Library/Logs/MCP on macOS
+const defaultLogDir = path.join(os.homedir(), 'Library', 'Logs', 'MCP');
+const logDir = process.env.LOG_DIR || defaultLogDir;
 
 export const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
@@ -24,8 +30,8 @@ export const logger = winston.createLogger({
   ),
   defaultMeta: { service: 'youtrack-mcp' },
   transports: [
-    new winston.transports.File({ filename: 'error.log', level: 'error' }),
-    new winston.transports.File({ filename: 'combined.log' }),
+    new winston.transports.File({ filename: path.join(logDir, 'youtrack-error.log'), level: 'error' }),
+    new winston.transports.File({ filename: path.join(logDir, 'youtrack-combined.log') }),
     new winston.transports.Console({
       // Send ALL log levels to stderr (not stdout) for MCP compatibility
       // MCP servers must only write JSON-RPC messages to stdout

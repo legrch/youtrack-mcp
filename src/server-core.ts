@@ -68,8 +68,8 @@ function createToolDefinitions(configLoader: DynamicConfigLoader) {
       properties: {
         action: {
           type: 'string',
-          enum: ['create', 'update', 'get', 'query', 'search', 'count', 'state', 'complete', 'start', 'link', 'move', 'watchers', 'add_watcher', 'remove_watcher', 'toggle_star', 'get_field_values'],
-          description: 'Action: create (new issue), update (modify), get (single issue), query (advanced search), search (smart search), count (get count of issues matching query), state (change state), complete (mark done), start (begin work), link (relate issues), move (move to another project), watchers (get watchers), add_watcher (add user as watcher), remove_watcher (remove watcher), toggle_star (star/unstar issue), get_field_values (discover available Type/Priority/State values for a project)'
+          enum: ['create', 'update', 'delete', 'get', 'query', 'search', 'count', 'state', 'complete', 'start', 'link', 'move', 'watchers', 'add_watcher', 'remove_watcher', 'toggle_star', 'get_field_values'],
+          description: 'Action: create (new issue), update (modify), delete (permanently remove issue), get (single issue), query (advanced search), search (smart search), count (get count), state (change state), complete (mark done), start (begin work), link (relate issues), move (move to project), watchers (get watchers), add_watcher, remove_watcher, toggle_star, get_field_values'
         },
         projectId: {
           type: 'string',
@@ -132,6 +132,23 @@ function createToolDefinitions(configLoader: DynamicConfigLoader) {
           type: 'string',
           description: 'Link command phrase (for example: "relates to", "depends on", "duplicates", "subtask of", "parent for")',
           default: 'relates to'
+        },
+        parentId: {
+          type: 'string',
+          description: 'Parent issue ID for "subtask of" link (e.g., "SC-466"). Required by projects with parent-link workflow rules.'
+        },
+        devTeam: {
+          type: 'string',
+          description: 'Dev team assignment (only for Task/Feature/Bug types). Values: Backend, Frontend, Design, QA, PM, DevOps, DataEngeneer'
+        },
+        businessProc: {
+          type: 'string',
+          description: 'Business process. Values: Department, WB Rent, ALL process, Auth, DevOps, Shared, etc.'
+        },
+        sorting: {
+          type: 'integer',
+          description: 'Sorting order (integer, default 0). Required by some projects.',
+          default: 0
         }
       },
       required: ['action']
@@ -1118,7 +1135,7 @@ export class YouTrackMCPServer {
   }
 
   private async handleIssuesManage(client: any, args: any) {
-    const { action, projectId, issueId, userId, summary, description, query, state, comment, priority, assignee, type, targetIssueId, targetProjectId, linkType, fieldName } = args;
+    const { action, projectId, issueId, userId, summary, description, query, state, comment, priority, assignee, type, targetIssueId, targetProjectId, linkType, fieldName, parentId, devTeam, businessProc, sorting } = args;
     let normalizedLinkType = linkType;
     
     // Validate parameters based on action
@@ -1132,6 +1149,7 @@ export class YouTrackMCPServer {
           ParameterValidator.validateProjectId(projectId, 'projectId');
           break;
         case 'update':
+        case 'delete':
         case 'get':
         case 'state':
         case 'complete':
@@ -1177,13 +1195,15 @@ export class YouTrackMCPServer {
     
     switch (action) {
       case 'create':
-        return await client.issues.createIssue(this.resolveProjectId(projectId), { 
-          summary, description, priority, assignee, type 
+        return await client.issues.createIssue(this.resolveProjectId(projectId), {
+          summary, description, priority, assignee, type, parentId, devTeam, businessProc, sorting
         });
       case 'update':
-        return await client.issues.updateIssue(issueId, { 
-          summary, description, state, priority, assignee, type 
+        return await client.issues.updateIssue(issueId, {
+          summary, description, state, priority, assignee, type
         });
+      case 'delete':
+        return await client.issues.deleteIssue(issueId);
       case 'get':
         return await client.issues.getIssue(issueId);
       case 'get_field_values':

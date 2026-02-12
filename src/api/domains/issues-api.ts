@@ -12,6 +12,10 @@ export interface IssueCreateParams {
   assignee?: string;
   dueDate?: string;
   tags?: string[];
+  parentId?: string;
+  devTeam?: string;
+  businessProc?: string;
+  sorting?: number;
   [key: string]: any;
 }
 
@@ -43,53 +47,116 @@ export interface IssueQueryParams {
 export class IssuesAPIClient extends BaseAPIClient {
   
   /**
-   * Create a new issue
+   * Create a new issue using draft-based approach.
+   *
+   * Uses a 3-step process to satisfy YouTrack workflow rules that require
+   * parent links and custom fields at creation time:
+   *   1. Create a draft (POST /users/me/drafts)
+   *   2. Apply fields via command API (POST /commands) — sets parent link,
+   *      type, priority, sorting, dev_team etc. on the draft
+   *   3. Submit the draft as a real issue (POST /issues?draftId=...)
+   *
+   * This approach works around the fact that YouTrack REST API v2 does NOT
+   * support `links` in the POST /api/issues body (causes 500).
    */
   async createIssue(projectId: string, params: IssueCreateParams): Promise<MCPResponse> {
     try {
-      const endpoint = `/issues`;
-      
-      // Accept either internal ID (e.g., 0-2) or shortName (e.g., MYDAPI)
-      const isInternalId = /^\d+-\d+$/.test(projectId);
-      const projectRef: any = { $type: 'Project' };
-      if (isInternalId) {
-        projectRef.id = projectId;
-      } else {
-        projectRef.shortName = projectId;
-      }
+      // Resolve project shortName to internal ID (YouTrack requires 'id' for creation)
+      const internalProjectId = await this.resolveInternalProjectId(projectId);
 
-      const issueData = {
-        $type: 'Issue',
-        project: projectRef,
+      // Step 1: Create draft
+      const draftResponse = await this.post('/users/me/drafts', {
+        project: { id: internalProjectId },
         summary: params.summary,
         description: sanitizeDescription(params.description),
-        ...this.buildCustomFields(params)
-      };
-      
-      const response = await this.post(endpoint, issueData);
-      const issueId = response.data.id;
-      
-      // Apply custom fields via commands after creation (more reliable)
-      const commandFailures: string[] = [];
-      if (issueId && (params.type || params.priority || params.state || params.assignee || params.subsystem)) {
+        usesMarkdown: true
+      });
+      const draftId = draftResponse.data?.id;
+      if (!draftId) {
+        return ResponseFormatter.formatError(
+          'Failed to create draft — no ID returned',
+          { projectId, summary: params.summary }
+        );
+      }
+
+      // Step 2: Build command string for all fields
+      const commandParts: string[] = [];
+
+      // Parent link (required by some project workflow rules)
+      if (params.parentId) {
+        commandParts.push(`subtask of ${params.parentId}`);
+      }
+
+      // Type
+      if (params.type) {
+        commandParts.push(`Type: ${params.type}`);
+      }
+
+      // Priority (default: Normal)
+      commandParts.push(`Priority: ${params.priority || 'Normal'}`);
+
+      // Sorting — only valid for Epic, User Story, Feature (not Task/Bug/DevOps)
+      const typeStr = (params.type || '').toLowerCase();
+      if (['epic', 'user story', 'feature'].includes(typeStr) || !params.type) {
+        commandParts.push(`Sorting: ${params.sorting ?? 0}`);
+      }
+
+      // Dev_Team — only valid for Task, Feature, Bug, DevOps (not Epic/User Story)
+      if (['task', 'feature', 'bug', 'devops'].includes(typeStr) && params.devTeam) {
+        commandParts.push(`Dev_Team: ${params.devTeam}`);
+      }
+
+      // Assignee
+      if (params.assignee) {
+        commandParts.push(`Assignee: ${params.assignee}`);
+      }
+
+      const command = commandParts.join(' ');
+
+      try {
+        await this.post('/commands', {
+          query: command,
+          issues: [{ id: draftId }]
+        });
+      } catch (cmdError: any) {
+        const cmdMsg = cmdError.message || String(cmdError);
+        logger.warn(`Command failed for draft ${draftId}: ${cmdMsg}`);
+        return ResponseFormatter.formatError(
+          `Draft created but failed to apply fields: ${cmdMsg}`,
+          { draftId, command, projectId }
+        );
+      }
+
+      // Step 3: Submit draft as a real issue (request idReadable in response)
+      const issueResponse = await this.post(`/issues?draftId=${draftId}&fields=id,idReadable,summary,$type`, {});
+      const issue = issueResponse.data;
+      const idReadable = issue.idReadable || issue.id;
+
+      // Step 4 (optional): Set Business_proc via custom fields API if specified
+      // (Business_proc is not supported in command API; it inherits from parent by default)
+      if (params.businessProc && idReadable) {
         try {
-          const failures = await this.applyCustomFieldsViaCommands(issueId, params);
-          commandFailures.push(...failures);
-        } catch (error) {
-          logger.warn(`Issue ${issueId} created but failed to apply some custom fields:`, error);
-          commandFailures.push(`Unexpected error applying custom fields: ${error instanceof Error ? error.message : String(error)}`);
+          await this.applyCommand(idReadable, `Business_proc ${params.businessProc}`);
+        } catch {
+          // If command fails, try direct field update
+          try {
+            const fieldsResp = await this.get(`/issues/${idReadable}`, { fields: 'customFields(id,name,projectCustomField(id))' });
+            const bpField = fieldsResp.data?.customFields?.find((f: any) => f.name === 'Business_proc');
+            if (bpField) {
+              await this.post(`/issues/${idReadable}/customFields/${bpField.projectCustomField?.id || bpField.id}`, {
+                value: { name: params.businessProc }
+              });
+            }
+          } catch (bpErr: any) {
+            logger.warn(`Created ${idReadable} but failed to set Business_proc: ${bpErr.message}`);
+          }
         }
       }
-      
-      // Build response message with warnings if commands failed
-      let message = `Issue "${params.summary}" created successfully`;
-      if (commandFailures.length > 0) {
-        message += `\n\n⚠️ WARNINGS - Some custom fields could not be applied:\n${commandFailures.map(f => `  • ${f}`).join('\n')}`;
-        message += `\n\nThe issue was created (${issueId}) but you may need to set these fields manually in YouTrack.`;
-        message += `\n\nCommon causes:\n  • Field value doesn't exist in the project (e.g., "Bug" or "Feature" not configured)\n  • Field is not available for this project\n  • Invalid value format`;
-      }
-      
-      return ResponseFormatter.formatCreated(response.data, 'Issue', message);
+      return ResponseFormatter.formatCreated(
+        issue,
+        'Issue',
+        `Issue "${params.summary}" created successfully as ${idReadable}`
+      );
     } catch (error: any) {
       // Check for common errors
       if (error.message?.includes('404') || error.message?.includes('not found')) {
@@ -98,19 +165,44 @@ export class IssuesAPIClient extends BaseAPIClient {
           { projectId, summary: params.summary }
         );
       }
-      
+
       if (error.message?.includes('403') || error.message?.includes('Forbidden')) {
         return ResponseFormatter.formatError(
           `You don't have permission to create issues in project ${projectId}.`,
           { projectId, action: 'create' }
         );
       }
-      
+
+      // Network / connection errors (e.g., VPN off)
+      const errorMsg = error.message || '';
+      if (errorMsg.includes('circular structure') || errorMsg.includes('ECONNREFUSED') || errorMsg.includes('ETIMEDOUT') || errorMsg.includes('ENOTFOUND')) {
+        return ResponseFormatter.formatError(
+          `Network error connecting to YouTrack. Check VPN/network connectivity.`,
+          { projectId, action: 'create' }
+        );
+      }
+
       // Other errors
       return ResponseFormatter.formatError(
-        error.message || String(error),
+        errorMsg || String(error),
         { projectId, summary: params.summary, action: 'create' }
       );
+    }
+  }
+
+  /**
+   * Resolve a project shortName (e.g., "SC") to internal ID (e.g., "77-1072").
+   * If already an internal ID format (digits-digits), returns as-is.
+   */
+  private async resolveInternalProjectId(projectId: string): Promise<string> {
+    const isInternalId = /^\d+-\d+$/.test(projectId);
+    if (isInternalId) return projectId;
+
+    try {
+      const projResponse = await this.get(`/admin/projects/${projectId}`, { fields: 'id' });
+      return projResponse.data?.id || projectId;
+    } catch {
+      return projectId;
     }
   }
   
