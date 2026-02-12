@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (2026-02-12)
+- **Draft-based issue creation** for projects with workflow rules requiring parent links
+  - 3-step approach: create draft → apply command (type, parent, priority, sorting) → submit draft
+  - Type-aware field restrictions: Sorting only for Epic/US/Feature, Dev_Team only for Task/Feature/Bug
+  - New params: `parentId`, `devTeam`, `businessProc`, `sorting`
+  - Automatic internal project ID resolution (shortName → internal ID)
+  - Business_proc post-creation step via custom fields API (not supported in command API)
+- **Delete action** for issues (`action: "delete"`)
+- **Full CRUD tested**: create → update (summary, description, priority) → state change → comment → delete
+- **Hierarchy chain creation**: Epic → User Story → Feature → Task with correct parent links
+
+### Changed (2026-02-12)
+- Log directory moved to `~/Library/Logs/MCP/` for macOS convention
+- Issue create response now includes `idReadable` field (e.g., `SC-1417` instead of internal ID)
+
 ### Fixed
 - **🔍 CODE QUALITY: ESLint Compliance** (2025-11-22)
   - Removed emojis from console log messages (CI restriction)
