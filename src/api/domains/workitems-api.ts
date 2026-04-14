@@ -75,18 +75,22 @@ export class WorkItemsAPIClient extends BaseAPIClient {
    */
   async logTimeToIssue(issueId: string, duration: string, description?: string, date?: string, workType?: string): Promise<MCPResponse> {
     try {
-      // Create work item at /workItems endpoint with issue reference
-      const endpoint = `/workItems?fields=id,date,duration(minutes,presentation),text,type(id,name),author(id,login,fullName),issue(id,idReadable)`;
-      
+      // Use per-issue endpoint (accepts readable IDs like SC-1687)
+      const fields = 'id,date,duration(minutes,presentation),text,type(id,name),author(id,login,fullName)';
+      const endpoint = `/issues/${issueId}/timeTracking/workItems?fields=${fields}`;
+
       const workData: any = {
-        issue: { id: issueId },
         duration: { minutes: this.parseDurationToMinutes(duration) },
         text: description || '',
         date: date ? new Date(date).getTime() : Date.now()
       };
 
       if (workType) {
-        workData.type = { name: workType };
+        // Resolve work type name to ID via API
+        const typeId = await this.resolveWorkTypeId(workType);
+        if (typeId) {
+          workData.type = { id: typeId };
+        }
       }
 
       const response = await this.post(endpoint, workData);
@@ -107,18 +111,27 @@ export class WorkItemsAPIClient extends BaseAPIClient {
    */
   async getTimeEntries(issueId?: string, startDate?: string, endDate?: string, userId?: string): Promise<MCPResponse> {
     try {
+      const fields = 'id,duration(minutes,presentation),date,text,type(id,name),author(id,login,fullName)';
+
+      // Use per-issue endpoint when issueId is provided (accepts readable IDs)
+      if (issueId) {
+        const endpoint = `/issues/${issueId}/timeTracking/workItems?fields=${fields}`;
+        const response = await this.get<TimeEntry[]>(endpoint);
+        const timeEntries = response.data || [];
+        return ResponseFormatter.formatList(timeEntries, 'time entry', {
+          totalCount: timeEntries.length
+        });
+      }
+
+      // Global endpoint for cross-issue queries
       const endpoint = `/workItems`;
-      
       const params: any = {
-        fields: 'id,duration(minutes,presentation),date,text,type(id,name),author(id,login,fullName),issue(id,summary)',
-        $top: 100  // Limit results
+        fields: fields + ',issue(id,summary)',
+        $top: 100
       };
 
-      // Build query string for filtering
       const queryParts: string[] = [];
-      if (issueId) queryParts.push(`issue: ${issueId}`);
       if (userId) queryParts.push(`author: ${userId}`);
-      
       if (queryParts.length > 0) {
         params.query = queryParts.join(' ');
       }
@@ -141,19 +154,25 @@ export class WorkItemsAPIClient extends BaseAPIClient {
   /**
    * Update a time entry
    */
-  async updateTimeEntry(timeEntryId: string, params: WorkItemUpdateParams): Promise<MCPResponse> {
+  async updateTimeEntry(timeEntryId: string, params: WorkItemUpdateParams, issueId?: string): Promise<MCPResponse> {
     try {
-      const endpoint = `/workItems/${timeEntryId}`;
-      
+      // Use per-issue endpoint if issueId provided, otherwise global
+      const endpoint = issueId
+        ? `/issues/${issueId}/timeTracking/workItems/${timeEntryId}`
+        : `/workItems/${timeEntryId}`;
+
       const updateData: any = {};
-      if (params.duration) updateData.duration = this.parseDurationToMinutes(params.duration);
-      if (params.description) updateData.description = params.description;
+      if (params.duration) updateData.duration = { minutes: this.parseDurationToMinutes(params.duration) };
+      if (params.description) updateData.text = params.description;
       if (params.date) updateData.date = new Date(params.date).getTime();
-      if (params.workType) updateData.type = { name: params.workType };
+      if (params.workType) {
+        const typeId = await this.resolveWorkTypeId(params.workType);
+        if (typeId) updateData.type = { id: typeId };
+      }
 
       const response = await this.put(endpoint, updateData);
       return ResponseFormatter.formatUpdated(response.data, 'Time Entry', updateData, `Time entry ${timeEntryId} updated`);
-      
+
     } catch (error: any) {
       throw new Error(`Failed to update time entry: ${error.message}`);
     }
@@ -162,12 +181,15 @@ export class WorkItemsAPIClient extends BaseAPIClient {
   /**
    * Delete a time entry
    */
-  async deleteTimeEntry(timeEntryId: string): Promise<MCPResponse> {
+  async deleteTimeEntry(timeEntryId: string, issueId?: string): Promise<MCPResponse> {
     try {
-      const endpoint = `/workItems/${timeEntryId}`;
+      // Use per-issue endpoint if issueId provided, otherwise global
+      const endpoint = issueId
+        ? `/issues/${issueId}/timeTracking/workItems/${timeEntryId}`
+        : `/workItems/${timeEntryId}`;
       await this.delete(endpoint);
       return ResponseFormatter.formatDeleted(timeEntryId, 'Time Entry');
-      
+
     } catch (error: any) {
       throw new Error(`Failed to delete time entry: ${error.message}`);
     }
@@ -178,18 +200,29 @@ export class WorkItemsAPIClient extends BaseAPIClient {
    */
   async getWorkItems(issueId?: string, projectId?: string, userId?: string): Promise<MCPResponse> {
     try {
+      const fields = 'id,duration(minutes,presentation),date,text,type(id,name),author(id,login,fullName)';
+
+      // Use per-issue endpoint when issueId is provided
+      if (issueId) {
+        const endpoint = `/issues/${issueId}/timeTracking/workItems?fields=${fields}`;
+        const response = await this.get<WorkItem[]>(endpoint);
+        const workItems = response.data || [];
+        return ResponseFormatter.formatList(workItems, 'work item', {
+          totalCount: workItems.length
+        });
+      }
+
+      // Global endpoint for cross-issue queries
       const endpoint = `/workItems`;
       const params: any = {
-        fields: 'id,duration(minutes,presentation),date,text,type(id,name),author(id,login,fullName),issue(id,summary,project(id,name,shortName))',
+        fields: fields + ',issue(id,summary,project(id,name,shortName))',
         $top: 100
       };
 
-      // Build query for filtering
       const queryParts: string[] = [];
-      if (issueId) queryParts.push(`issue: ${issueId}`);
       if (projectId) queryParts.push(`project: ${projectId}`);
       if (userId) queryParts.push(`author: ${userId}`);
-      
+
       if (queryParts.length > 0) {
         params.query = queryParts.join(' ');
       }
@@ -211,17 +244,21 @@ export class WorkItemsAPIClient extends BaseAPIClient {
    */
   async createWorkItem(params: WorkItemCreateParams): Promise<MCPResponse> {
     try {
-      const endpoint = `/workItems?fields=id,date,duration(minutes,presentation),text,type(id,name),author(id,login,fullName),issue(id,idReadable)`;
-      
+      // Use per-issue endpoint (accepts readable IDs like SC-1687)
+      const fields = 'id,date,duration(minutes,presentation),text,type(id,name),author(id,login,fullName)';
+      const endpoint = `/issues/${params.issueId}/timeTracking/workItems?fields=${fields}`;
+
       const workData: any = {
-        issue: { id: params.issueId },
         duration: { minutes: this.parseDurationToMinutes(params.duration) },
         text: params.description || '',
         date: params.date ? new Date(params.date).getTime() : Date.now()
       };
-      
+
       if (params.workType) {
-        workData.type = { name: params.workType };
+        const typeId = await this.resolveWorkTypeId(params.workType);
+        if (typeId) {
+          workData.type = { id: typeId };
+        }
       }
 
       const response = await this.post(endpoint, workData);
@@ -275,6 +312,22 @@ export class WorkItemsAPIClient extends BaseAPIClient {
       
     } catch (error: any) {
       throw new Error(`Failed to generate time report: ${error.message}`);
+    }
+  }
+
+  /**
+   * Resolve work type name to ID via API
+   */
+  private async resolveWorkTypeId(workTypeName: string): Promise<string | null> {
+    try {
+      const response = await this.get<Array<{ id: string; name: string }>>('/admin/timeTrackingSettings/workItemTypes', {
+        fields: 'id,name'
+      });
+      const types = response.data || [];
+      const found = types.find((t: any) => t.name.toLowerCase() === workTypeName.toLowerCase());
+      return found?.id || null;
+    } catch {
+      return null;
     }
   }
 

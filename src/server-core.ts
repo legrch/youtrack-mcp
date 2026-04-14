@@ -1535,9 +1535,9 @@ export class YouTrackMCPServer {
       case 'get_time_entries':
         return await client.workItems.getTimeEntries(issueId, startDate, endDate, userId);
       case 'update_time_entry':
-        return await client.workItems.updateTimeEntry(timeEntryId, { duration, description, date, workType });
+        return await client.workItems.updateTimeEntry(timeEntryId, { duration, description, date, workType }, issueId);
       case 'delete_time_entry':
-        return await client.workItems.deleteTimeEntry(timeEntryId);
+        return await client.workItems.deleteTimeEntry(timeEntryId, issueId);
       case 'get_work_items':
         return await client.workItems.getWorkItems(issueId, projectId, userId);
       case 'create_work_item':
@@ -1868,14 +1868,49 @@ export class YouTrackMCPServer {
     }
   }
 
+
+  /**
+   * Fast DNS check to verify YouTrack is reachable (VPN check).
+   * Returns true if reachable, false otherwise. Timeout: 500ms.
+   */
+  private async isYouTrackReachable(): Promise<boolean> {
+    const { youtrackUrl } = this.config.get();
+    try {
+      const url = new URL(youtrackUrl);
+      const dns = await import('dns');
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('DNS timeout')), 500);
+        dns.lookup(url.hostname, (err) => {
+          clearTimeout(timer);
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      return true;
+    } catch {
+      logger.warn(`YouTrack unreachable (not on VPN?): ${youtrackUrl}`);
+      return false;
+    }
+  }
+
   async connect(transport: Transport): Promise<void> {
     this.transport = transport;
-    
-    // Initialize dynamic configuration before connecting
-    await this.initializeDynamicConfig();
-    
+
+    // Fast DNS check — skip dynamic config if YouTrack is unreachable (not on VPN)
+    const reachable = await this.isYouTrackReachable();
+    if (reachable) {
+      await this.initializeDynamicConfig();
+    } else {
+      logger.info('Skipping dynamic config — YouTrack unreachable (VPN off?)');
+      this.toolDefinitions = createToolDefinitions(this.configLoader!);
+    }
+
     await this.server.connect(transport);
-    await this.initializeNotifications();
+
+    if (reachable) {
+      await this.initializeNotifications();
+    }
+
     logger.info('YouTrack MCP Server connected', {
       transport: transport.constructor?.name ?? 'UnknownTransport',
       toolCount: this.toolDefinitions.length,
