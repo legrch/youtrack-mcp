@@ -70,10 +70,12 @@ export class ErrorHandler {
       
     } else if (error.request) {
       const message = 'Network error: Unable to reach YouTrack server';
-      logError(new Error(message), { 
-        ...context,
-        error: error.message,
-        request: error.request 
+      logError(new Error(message), {
+        errorMessage: error.message,
+        errorCode: error.code,
+        httpMethod: error.config?.method,
+        url: error.config?.url,
+        hasRequest: true
       });
       throw new Error(message);
       

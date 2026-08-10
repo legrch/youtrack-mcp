@@ -300,6 +300,14 @@ Recommended token capabilities: Issues (R/W), Projects (Read), Knowledge Base (R
 
 ---
 
+## Roadmap
+
+The cross-project roadmap for typed YouTrack capabilities, safe writes, and version compatibility
+is maintained in [docs/ROADMAP.md](docs/ROADMAP.md). It covers the live WB 2024.3 baseline and
+2025.2/2026.x contracts while keeping project profiles and identifiers outside the generic core.
+
+---
+
 ## Contributing
 1. Fork & branch (`feature/x`)
 2. Implement + tests

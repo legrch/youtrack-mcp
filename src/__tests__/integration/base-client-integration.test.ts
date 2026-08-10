@@ -8,6 +8,16 @@ import { BaseAPIClient, type YouTrackConfig } from '../../api/base/base-client.j
 import { CacheManager } from '../../api/base/cache-manager.js';
 import { ErrorHandler } from '../../api/base/error-handler.js';
 import { ResponseFormatter } from '../../api/base/response-formatter.js';
+import { AxiosError } from 'axios';
+import { jest } from '@jest/globals';
+
+class RetryTestClient extends BaseAPIClient {
+  postEndpoint(endpoint: string, retry?: boolean) {
+    return retry === undefined
+      ? this.post(endpoint, { query: 'test' })
+      : this.post(endpoint, { query: 'test' }, { retry });
+  }
+}
 
 describe('BaseAPIClient - Integration Tests', () => {
   let config: YouTrackConfig;
@@ -84,6 +94,99 @@ describe('BaseAPIClient - Integration Tests', () => {
     test('should set accept header', () => {
       const axiosConfig = (client as any).axios.defaults;
       expect(axiosConfig.headers.Accept).toBe('application/json');
+    });
+
+    test('does not retry a request whose retry flag is false', async () => {
+      const retryClient = new RetryTestClient({
+        ...config,
+        retryAttempts: 3,
+        retryDelay: 0,
+      });
+      const adapter = jest.fn((requestConfig: any) => Promise.reject(
+        new AxiosError('timeout', 'ECONNABORTED', requestConfig, {})
+      ));
+      (retryClient as any).axios.defaults.adapter = adapter;
+
+      await expect(retryClient.postEndpoint('/other-mutation', false))
+        .rejects.toThrow('Network error');
+
+      expect(adapter).toHaveBeenCalledTimes(1);
+    });
+
+    test('never retries POST /commands with query parameters even when retry is enabled', async () => {
+      const retryClient = new RetryTestClient({
+        ...config,
+        retryAttempts: 3,
+        retryDelay: 0,
+      });
+      const adapter = jest.fn((requestConfig: any) => Promise.reject(
+        new AxiosError('timeout', 'ECONNABORTED', requestConfig, {})
+      ));
+      (retryClient as any).axios.defaults.adapter = adapter;
+
+      await expect(retryClient.postEndpoint('/commands?muteUpdateNotifications=true', true))
+        .rejects.toThrow('Network error');
+
+      expect(adapter).toHaveBeenCalledTimes(1);
+    });
+
+    test.each([503, 429])('never retries POST /commands after HTTP %i', async status => {
+      const retryClient = new RetryTestClient({
+        ...config,
+        retryAttempts: 3,
+        retryDelay: 0,
+      });
+      const adapter = jest.fn((requestConfig: any) => {
+        const error = new AxiosError(`HTTP ${status}`, undefined, requestConfig);
+        (error as any).response = {
+          status,
+          statusText: String(status),
+          data: {},
+          headers: {},
+          config: requestConfig,
+        };
+        return Promise.reject(error);
+      });
+      (retryClient as any).axios.defaults.adapter = adapter;
+
+      await expect(retryClient.postEndpoint('/commands'))
+        .rejects.toThrow(`YouTrack API Error (${status})`);
+
+      expect(adapter).toHaveBeenCalledTimes(1);
+    });
+
+    test('preserves the historical single-retry budget for retryable requests', async () => {
+      const retryClient = new RetryTestClient({
+        ...config,
+        retryAttempts: 2,
+        retryDelay: 0,
+      });
+      const adapter = jest.fn((requestConfig: any) => Promise.reject(
+        new AxiosError('timeout', 'ECONNABORTED', requestConfig, {})
+      ));
+      (retryClient as any).axios.defaults.adapter = adapter;
+
+      await expect(retryClient.postEndpoint('/other-mutation'))
+        .rejects.toThrow('Network error');
+
+      expect(adapter).toHaveBeenCalledTimes(2);
+    });
+
+    test('allows retryAttempts to disable retries with zero', async () => {
+      const retryClient = new RetryTestClient({
+        ...config,
+        retryAttempts: 0,
+        retryDelay: 0,
+      });
+      const adapter = jest.fn((requestConfig: any) => Promise.reject(
+        new AxiosError('timeout', 'ECONNABORTED', requestConfig, {})
+      ));
+      (retryClient as any).axios.defaults.adapter = adapter;
+
+      await expect(retryClient.postEndpoint('/other-mutation'))
+        .rejects.toThrow('Network error');
+
+      expect(adapter).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -291,6 +394,26 @@ describe('ErrorHandler - Integration Tests', () => {
       expect(() => {
         ErrorHandler.handleApiError(axiosError);
       }).toThrow();
+    });
+
+    test('should preserve the network error when the Axios request is circular', () => {
+      const request: any = {};
+      const agent = {
+        sockets: {
+          'youtrack.example.com:443': [{ _httpMessage: request }],
+        },
+      };
+      request.agent = agent;
+
+      const axiosError = new AxiosError(
+        'socket hang up',
+        'ECONNRESET',
+        { method: 'get', url: '/agiles/board-1' } as any,
+        request
+      );
+
+      expect(() => ErrorHandler.handleApiError(axiosError))
+        .toThrow('Network error: Unable to reach YouTrack server');
     });
   });
 });

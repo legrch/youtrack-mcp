@@ -1,4 +1,4 @@
-import axios, { AxiosInstance, AxiosError } from 'axios';
+import axios, { AxiosInstance, AxiosError, AxiosRequestConfig } from 'axios';
 import { CacheManager } from './cache-manager.js';
 import { ErrorHandler } from './error-handler.js';
 
@@ -23,6 +23,18 @@ export interface APIResponse<T = any> {
   status: number;
   statusText: string;
   headers: any;
+}
+
+export interface APIRequestOptions {
+  params?: any;
+  /** Disable the response interceptor retry loop for this request. */
+  retry?: boolean;
+}
+
+interface RetryAwareAxiosRequestConfig extends AxiosRequestConfig {
+  _retry?: boolean;
+  _retryCount?: number;
+  retry?: boolean;
 }
 
 /**
@@ -104,8 +116,17 @@ export class BaseAPIClient {
   /**
    * Perform POST request
    */
-  protected async post<T = any>(endpoint: string, data?: any): Promise<APIResponse<T>> {
-    const response = await this.axios.post(endpoint, data);
+  protected async post<T = any>(
+    endpoint: string,
+    data?: any,
+    options: APIRequestOptions = {}
+  ): Promise<APIResponse<T>> {
+    const requestConfig: RetryAwareAxiosRequestConfig = {};
+    if (options.params !== undefined) requestConfig.params = options.params;
+    if (options.retry !== undefined) requestConfig.retry = options.retry;
+    const response = Object.keys(requestConfig).length > 0
+      ? await this.axios.post(endpoint, data, requestConfig)
+      : await this.axios.post(endpoint, data);
     
     // Invalidate related cache entries
     if (this.config.enableCache !== false) {
@@ -194,18 +215,22 @@ export class BaseAPIClient {
     this.axios.interceptors.response.use(
       (response) => response,
       async (error: AxiosError) => {
-        const originalRequest = error.config as any;
+        const originalRequest = error.config as RetryAwareAxiosRequestConfig | undefined;
         
         // Retry logic for transient errors
-        if (this.shouldRetry(error) && !originalRequest._retry) {
+        if (originalRequest &&
+            !originalRequest._retry &&
+            !this.isRetryDisabled(originalRequest) &&
+            this.shouldRetry(error)) {
           originalRequest._retry = true;
-          const retryCount = originalRequest._retryCount || 0;
-          
-          if (retryCount < (this.config.retryAttempts || 3)) {
+          const retryCount = originalRequest._retryCount ?? 0;
+          const retryAttempts = this.config.retryAttempts ?? 3;
+
+          if (retryCount < retryAttempts) {
             originalRequest._retryCount = retryCount + 1;
             
             // Exponential backoff
-            const delay = (this.config.retryDelay || 1000) * Math.pow(2, retryCount);
+            const delay = (this.config.retryDelay ?? 1000) * Math.pow(2, retryCount);
             await new Promise(resolve => setTimeout(resolve, delay));
             
             // Retry logging removed to prevent MCP client parse warnings
@@ -227,6 +252,19 @@ export class BaseAPIClient {
     
     const status = error.response.status;
     return status >= 500 || status === 429; // Server errors or rate limiting
+  }
+
+  /**
+   * Commands are name-based mutations and must never be replayed after an
+   * ambiguous response. The request flag provides the same protection for
+   * other non-idempotent writes.
+   */
+  private isRetryDisabled(config: RetryAwareAxiosRequestConfig): boolean {
+    if (config.retry === false) return true;
+    if (config.method?.toLowerCase() !== 'post') return false;
+
+    const path = (config.url ?? '').split('?')[0].replace(/\/+$/, '');
+    return /(?:^|\/)commands$/.test(path);
   }
 
   /**

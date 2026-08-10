@@ -224,7 +224,7 @@ function createToolDefinitions(configLoader: DynamicConfigLoader) {
         },
         boardId: {
           type: 'string',
-          description: 'Board ID (required for board_details, sprints, sprint_details, create_sprint, update_sprint, delete_sprint, archive_sprint, sprint_issues, assign_issues)'
+          description: 'Board ID (required for board_details, sprints, sprint_details, create_sprint, update_sprint, delete_sprint, archive_sprint, sprint_issues, assign_issues, unassign_issues)'
         },
         sprintId: {
           type: 'string',
@@ -585,8 +585,8 @@ The server will reject content starting with single # to prevent duplication.`
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'get', 'create', 'update', 'delete', 'types', 'list_bundles', 'get_bundle', 'create_bundle', 'add_bundle_value', 'project_fields', 'add_to_project', 'remove_from_project', 'issue_fields', 'update_issue_field'],
-          description: 'Action: list (all fields), get (field details), create (new field), update (edit field), delete (remove field), types (available types), list_bundles (all bundles), get_bundle (bundle details), create_bundle (new bundle), add_bundle_value (add value to bundle), project_fields (project custom fields), add_to_project (add field to project), remove_from_project (remove field from project), issue_fields (issue custom fields), update_issue_field (update issue field value)'
+          enum: ['list', 'get', 'create', 'update', 'delete', 'types', 'list_bundles', 'get_bundle', 'create_bundle', 'add_bundle_value', 'update_bundle_value', 'project_fields', 'add_to_project', 'remove_from_project', 'issue_fields', 'update_issue_field'],
+          description: 'Action: list (all fields), get (field details), create (new field), update (edit field), delete (remove field), types (available types), list_bundles (enum/state bundles), get_bundle (bundle details), create_bundle (new bundle), add_bundle_value (add value), update_bundle_value (rename/reorder/archive/resolve a value), project_fields (project custom fields), add_to_project (add field to project), remove_from_project (remove field from project), issue_fields (issue custom fields), update_issue_field (update issue field value)'
         },
         fieldId: {
           type: 'string',
@@ -594,7 +594,17 @@ The server will reject content starting with single # to prevent duplication.`
         },
         bundleId: {
           type: 'string',
-          description: 'Bundle ID (required for get_bundle, add_bundle_value actions)'
+          description: 'Bundle ID (required for get_bundle, add_bundle_value, update_bundle_value actions)'
+        },
+        bundleType: {
+          type: 'string',
+          enum: ['enum', 'state'],
+          default: 'enum',
+          description: 'Bundle type for bundle actions. Defaults to enum for backward compatibility.'
+        },
+        valueId: {
+          type: 'string',
+          description: 'Bundle value ID (required for update_bundle_value)'
         },
         projectId: {
           type: 'string',
@@ -621,7 +631,10 @@ The server will reject content starting with single # to prevent duplication.`
             type: 'object',
             properties: {
               name: { type: 'string' },
-              description: { type: 'string' }
+              description: { type: 'string' },
+              isResolved: { type: 'boolean' },
+              archived: { type: 'boolean' },
+              ordinal: { type: 'integer' }
             }
           },
           description: 'Bundle values (for create_bundle action)'
@@ -629,6 +642,18 @@ The server will reject content starting with single # to prevent duplication.`
         description: {
           type: 'string',
           description: 'Description for bundle value'
+        },
+        isResolved: {
+          type: 'boolean',
+          description: 'Whether a state bundle value resolves issues'
+        },
+        archived: {
+          type: 'boolean',
+          description: 'Whether a bundle value is archived'
+        },
+        ordinal: {
+          type: 'integer',
+          description: 'Bundle value position'
         },
         isPublic: {
           type: 'boolean',
@@ -1346,9 +1371,15 @@ export class YouTrackMCPServer {
           throw new Error('issueIds must be an array of issue IDs');
         }
         return await client.agile.assignIssuesToSprint({ boardId, sprintId, issueIds });
+
+      case 'unassign_issues':
+        if (!issueIds || !Array.isArray(issueIds)) {
+          throw new Error('issueIds must be an array of issue IDs');
+        }
+        return await client.agile.unassignIssuesFromSprint({ boardId, sprintId, issueIds });
       
       default:
-        throw new Error(`Unknown agile action: ${action}. Available actions: boards, board_details, sprints, sprint_details, create_sprint, update_sprint, delete_sprint, archive_sprint, sprint_issues, assign_issues`);
+        throw new Error(`Unknown agile action: ${action}. Available actions: boards, board_details, sprints, sprint_details, create_sprint, update_sprint, delete_sprint, archive_sprint, sprint_issues, assign_issues, unassign_issues`);
     }
   }
 
@@ -1619,7 +1650,27 @@ export class YouTrackMCPServer {
   }
 
   private async handleCustomFieldsManage(client: any, args: any) {
-    const { action, fieldId, bundleId, projectId, issueId, name, fieldType, value, values, description, isPublic, canBeEmpty, emptyFieldText, fields } = args;
+    const {
+      action,
+      fieldId,
+      bundleId,
+      bundleType = 'enum',
+      valueId,
+      projectId,
+      issueId,
+      name,
+      fieldType,
+      value,
+      values,
+      description,
+      isResolved,
+      archived,
+      ordinal,
+      isPublic,
+      canBeEmpty,
+      emptyFieldText,
+      fields
+    } = args;
     
     // Validate parameters based on action
     try {
@@ -1628,9 +1679,29 @@ export class YouTrackMCPServer {
         ParameterValidator.validateRequired(fieldId, 'fieldId');
       }
       
-      const needsBundleId = ['get_bundle', 'add_bundle_value'];
+      const needsBundleId = ['get_bundle', 'add_bundle_value', 'update_bundle_value'];
       if (needsBundleId.includes(action)) {
         ParameterValidator.validateRequired(bundleId, 'bundleId');
+      }
+
+      if (['list_bundles', 'get_bundle', 'create_bundle', 'add_bundle_value', 'update_bundle_value'].includes(action)
+          && !['enum', 'state'].includes(bundleType)) {
+        throw new Error('bundleType must be either enum or state');
+      }
+
+      const createValuesContainResolved = Array.isArray(values)
+        && values.some(bundleValue => bundleValue?.isResolved !== undefined);
+      if (bundleType !== 'state'
+          && ['create_bundle', 'add_bundle_value', 'update_bundle_value'].includes(action)
+          && (isResolved !== undefined || createValuesContainResolved)) {
+        throw new Error('isResolved is only supported for state bundle values');
+      }
+
+      if (action === 'update_bundle_value') {
+        ParameterValidator.validateRequired(valueId, 'valueId');
+        if ([name, description, isResolved, archived, ordinal].every(item => item === undefined)) {
+          throw new Error('update_bundle_value requires at least one value property to update');
+        }
       }
       
       const needsProjectId = ['project_fields', 'add_to_project', 'remove_from_project'];
@@ -1684,13 +1755,24 @@ export class YouTrackMCPServer {
       case 'types':
         return await client.customFields.listFieldTypes(fields);
       case 'list_bundles':
-        return await client.customFields.listEnumBundles(fields);
+        return await client.customFields.listBundles(bundleType, fields);
       case 'get_bundle':
-        return await client.customFields.getEnumBundle(bundleId, fields);
+        return await client.customFields.getBundle(bundleId, bundleType, fields);
       case 'create_bundle':
-        return await client.customFields.createEnumBundle({ name, values });
+        return await client.customFields.createBundle({ name, values, bundleType });
       case 'add_bundle_value':
-        return await client.customFields.addEnumBundleValue(bundleId, name, description);
+        return await client.customFields.addBundleValue(
+          bundleId,
+          { name, description, isResolved, archived, ordinal },
+          bundleType
+        );
+      case 'update_bundle_value':
+        return await client.customFields.updateBundleValue(
+          bundleId,
+          valueId,
+          { name, description, isResolved, archived, ordinal },
+          bundleType
+        );
       case 'project_fields':
         return await client.customFields.getProjectCustomFields(projectId, fields);
       case 'add_to_project':
